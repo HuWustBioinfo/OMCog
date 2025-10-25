@@ -3,7 +3,7 @@ library(tableone)
 myvars <- c("Age","Age_quartile","Gender","Residence","Education_level3","Smoking","Drinking",
             "Exercise","Hypertension","Hyperlipidemia","Diabetes","Cerebrovascular",
             "ABSI100","ZGABSI100","WWI","CI","RFM","BRI","WHTR","WC","BMI","WHR","MCI",
-            "Global_score","Memory","Language","Attention","Executive","Year","MMSE_score") # All variables
+            "Global","Memory","Language","Attention","Executive","Year","MMSE_score") # All variables
 catvars <- c("Age_quartile","Gender","Residence","Education_level3","Smoking","Drinking",
              "Exercise","Hypertension","Hyperlipidemia","Diabetes","Cerebrovascular")# Factor variables
 tab2 <- CreateTableOne(vars = myvars, data =data, factorVars = catvars, strata = "CI")
