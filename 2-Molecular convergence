@@ -67,7 +67,7 @@ res <- topTable(fit2, coef = "BvsA", number = Inf, adjust.method = "BH") %>%
   )
 
 
-# 2.Trend clustering with Mfuzz (generic template)----------------------------------------------------------------------
+# 2.Trend clustering with Mfuzz (generic template)--------------------
 # Goal: cluster mean expression profiles across ordered groups (e.g., BMI quartiles)
 suppressPackageStartupMessages({
   library(dplyr); library(tidyr); library(tibble)
@@ -119,6 +119,7 @@ data_matrix <- group_mean %>%
 # (Optional) ensure columns are in the natural order of the factor
 data_matrix <- data_matrix[, levels(meta$BMI_quartile), drop = FALSE]
 
+
 # 5) (Optional) choose K using cascadeKM
 set.seed(7)
 # cascadeKM expects rows as observations; here each row is a feature profile across groups -> OK
@@ -155,3 +156,149 @@ readr::write_csv(membership, "mfuzz_membership.csv")
 # (Optional) list of features per cluster
 clusters_list <- split(membership$Feature, membership$Assigned)
 # saveRDS(clusters_list, file = "mfuzz_clusters_list.rds")
+
+
+#3.Selecting and Categorizing Trend Clusters --------------------------------------
+# This script identifies clusters with clear upward/downward trends or fluctuation patterns,
+# and further classifies the fluctuation intensity (mild / intermediate / strong).
+# 3.2.1 Identify clusters with clear monotonic (upward/downward) trends
+results <- list()
+cor_threshold <- 0.7   # Spearman correlation threshold
+for (i in 1:10) {
+  cluster_centers <- get(paste0("c", i))$centers  # extract cluster centers (mean profiles)
+  
+  # Average slope (mean of consecutive differences)
+  growth_rate <- apply(cluster_centers, 1, function(x) mean(diff(x)))
+  
+  # Upward trends: positive mean slope and strong positive correlation with group order
+  selected_up <- which(
+    growth_rate > 0 &
+      apply(cluster_centers, 1, function(x)
+        cor.test(1:length(x), x, method = "spearman")$estimate) > cor_threshold
+  )
+  
+  # Downward trends: negative mean slope and strong negative correlation
+  selected_down <- which(
+    growth_rate < 0 &
+      apply(cluster_centers, 1, function(x)
+        cor.test(1:length(x), x, method = "spearman")$estimate) < -cor_threshold
+  )
+  
+  # Store results
+  results[[i]] <- data.frame(
+    Cluster = paste0("c", i),
+    Upward_Trends = paste(selected_up, collapse = ", "),
+    Downward_Trends = paste(selected_down, collapse = ", ")
+  )
+}
+
+final_results <- do.call(rbind, results)
+print(final_results)
+
+# 3.2.2 Compute difference values between adjacent groups
+#     → used to detect fluctuating (non-monotonic) clusters
+all_diff_values <- list()
+for (i in 1:10) {
+  cluster_centers <- get(paste0("c", i))$centers
+  diff_values <- apply(cluster_centers, 1, function(x) diff(x))  # differences between consecutive groups
+  all_diff_values[[paste0("c", i)]] <- diff_values
+}
+
+# Identify fluctuating categories (having both positive and negative deltas)
+all_fluctuating_categories <- list()
+
+for (i in 1:10) {
+  diff_cluster <- all_diff_values[[paste0("c", i)]]
+  fluctuating <- c()
+  
+  for (j in 1:ncol(diff_cluster)) {
+    diffs <- diff_cluster[, j]
+    if (any(diffs > 0) && any(diffs < 0)) {  # contains both up and down
+      diff_sign_change <- diffs[which(diffs != min(diffs) & diffs != max(diffs))]
+      remaining <- abs(diffs[diffs != diff_sign_change])
+      
+      # if the sign-changing value is smaller (weaker) than others → real fluctuation
+      if (abs(diff_sign_change) < min(remaining)) {
+        fluctuating <- c(fluctuating, j)
+      }
+    }
+  }
+  
+  all_fluctuating_categories[[paste0("c", i)]] <- fluctuating
+}
+
+fluctuating_df <- do.call(rbind, lapply(names(all_fluctuating_categories), function(c) {
+  data.frame(Cluster = c,
+             Fluctuating_Categories = paste(all_fluctuating_categories[[c]], collapse = ", "))
+}))
+print(fluctuating_df)
+
+
+
+# 3.2.3 Classify fluctuation intensity (mild / intermediate / strong)
+mild_fluct <- list()
+strong_fluct <- list()
+intermediate_fluct <- list()
+
+for (i in 1:10) {
+  diff_cluster <- all_diff_values[[paste0("c", i)]]
+  
+  mild <- c(); strong <- c(); intermediate <- c()
+  
+  for (j in 1:ncol(diff_cluster)) {
+    diffs <- diff_cluster[, j]
+    
+    # Only evaluate categories with sign reversal (both + and - present)
+    if (any(diffs > 0) && any(diffs < 0)) {
+      signs <- sign(diffs)
+      
+      # Case: single reversal (simple up-down or down-up pattern)
+      if (length(unique(signs)) == 2) {
+        reverse_index <- which(signs != signs[which.max(tabulate(match(signs, unique(signs))))])
+        
+        if (length(reverse_index) == 1) {
+          reverse_value <- abs(diffs[reverse_index])
+          other_values <- abs(diffs[-reverse_index])
+          
+          # classify by relative magnitude of reversal
+          if (reverse_value < min(other_values)) {
+            mild <- c(mild, colnames(diff_cluster)[j])
+          } else if (reverse_value > max(other_values)) {
+            strong <- c(strong, colnames(diff_cluster)[j])
+          } else {
+            intermediate <- c(intermediate, colnames(diff_cluster)[j])
+          }
+        }
+      }
+    }
+  }
+  
+  mild_fluct[[paste0("c", i)]] <- mild
+  strong_fluct[[paste0("c", i)]] <- strong
+  intermediate_fluct[[paste0("c", i)]] <- intermediate
+}
+
+# Combine into unified summary
+clusters <- paste0("c", 1:10)
+combined_df <- data.frame(
+  Cluster = clusters,
+  Mild_Fluctuation = sapply(clusters, function(c) paste(mild_fluct[[c]], collapse = ", ")),
+  Intermediate_Fluctuation = sapply(clusters, function(c) paste(intermediate_fluct[[c]], collapse = ", ")),
+  Strong_Fluctuation = sapply(clusters, function(c) paste(strong_fluct[[c]], collapse = ", "))
+)
+
+print(combined_df)
+openxlsx::write.xlsx(combined_df, "fluctuation_summary.xlsx")
+
+
+
+# Summary
+# • Section 3.2.1 → identifies monotonic trends (up or down) using Spearman correlation.
+# • Section 3.2.2 → finds clusters showing fluctuation (non-monotonic) behavior.
+# • Section 3.2.3 → further classifies the fluctuating clusters into mild/intermediate/strong.
+# Output:
+#   - final_results: clusters with strong monotonic trends
+#   - fluctuating_df: clusters with sign changes (fluctuation)
+#   - combined_df: categorized fluctuation intensities
+
+
