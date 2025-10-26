@@ -12,7 +12,6 @@ class(MOFAobject)
 # Visualize data overview (missing values, features per view, etc.)
 plot_data_overview(MOFAobject)
 
-
 # 1.2 Define MOFA options
 ## 1) Data options
 data_opts <- get_default_data_options(MOFAobject)
@@ -45,7 +44,6 @@ MOFAobject <- prepare_mofa(
 # Run MOFA (disable basilisk if using external conda env)
 MOFAmodel <- run_mofa(MOFAobject, use_basilisk = FALSE)
 
-
 # 1.4 Save and reload trained model
 # Save the trained MOFA model with a timestamped filename
 saveRDS(
@@ -56,3 +54,283 @@ saveRDS(
 MOFAmodel <- readRDS("/Users/luoyu/Desktop/Cohort/Results/3-MOFA/MOFA_trained_20250806_104143.rds")
 # Assign the loaded model as the active MOFA object for downstream analyses
 MOFAobject <- MOFAmodel
+
+# 2. MOFA Enrichment Analysis (KEGG example, lipid-related)----------------------------
+# Requirements: MOFA2, clusterProfiler, org.Hs.eg.db, AnnotationDbi, tidyverse tools, openxlsx
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(tibble); library(purrr); library(stringr)
+  library(clusterProfiler)
+  library(org.Hs.eg.db); library(AnnotationDbi)
+  library(MOFA2)
+  library(openxlsx)
+  library(ggplot2)
+})
+# I/O (EDIT THESE PATHS)
+# Path to KEGG hierarchy .keg file (br08901)
+keg_file <- "data/KEGG/br08901.keg"   # TODO: set your file path
+# Output directory
+out_dir  <- "results/MOFA"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# MOFA model object in memory:
+#   - MOFAmodel or MOFAobject available from prior steps
+stopifnot(exists("MOFAmodel") || exists("MOFAobject"))
+if (!exists("MOFAmodel")) MOFAmodel <- MOFAobject
+
+# Which view/group/factor to use
+use_view  <- "Proteome"
+use_group <- "group1"       # change if your model uses different group names
+use_factor <- "Factor1"     # change as needed (e.g., "Factor2", ...)
+
+# 2.1 KEGG annotation (pathway ↔ genes) and hierarchy parsing
+# 1) Download KEGG pathway to gene mapping (human)
+kegg_list <- clusterProfiler::download_KEGG("hsa")
+kegg_list <- kegg_list[lengths(kegg_list) > 0]  # drop empty
+# Build a long df: Pathway_ID (hsaXXXXX) — ENTREZID
+kegg_links <- map_dfr(names(kegg_list), function(pid) {
+  genes <- kegg_list[[pid]]
+  tibble(Pathway_ID = pid, ENTREZID = genes)
+})
+# Preview
+print(head(kegg_links))
+
+# 2) Parse KEGG hierarchy (Level1 / Level2 / Pathway_ID / Pathway_Name)
+keg_lines <- readLines(keg_file)
+records <- list()
+Level1 <- Level2 <- NA_character_
+for (ln in keg_lines) {
+  ln <- str_trim(ln)
+  if (str_starts(ln, "A")) {
+    Level1 <- str_remove(ln, "^A\\s*")
+  } else if (str_starts(ln, "B")) {
+    Level2 <- str_remove(ln, "^B\\s*")
+  } else if (str_starts(ln, "C")) {
+    lx <- str_remove(ln, "^C\\s*")
+    id  <- str_extract(lx, "^\\d{5}")
+    nm  <- str_trim(str_remove(lx, "^\\d{5}\\s+"))
+    records[[length(records)+1]] <- tibble(
+      Level1 = Level1, Level2 = Level2,
+      Pathway_ID = paste0("hsa", id),
+      Pathway_Name = nm
+    )
+  }
+}
+kegg_hier <- bind_rows(records) %>%
+  mutate(across(c(Level1, Level2, Pathway_Name), ~str_remove_all(.x, "<.*?>")))
+print(head(kegg_hier))
+
+# 3) Merge mapping (links) with hierarchy
+kegg_annot <- kegg_links %>% left_join(kegg_hier, by = "Pathway_ID")
+print(head(kegg_annot))
+
+# 4) Filter lipid-related pathways by keywords
+lipid_keywords <- c("lipid","fatty","steroid","cholesterol","phospholipase",
+                    "sphingo","adipocytokine","peroxisome")
+pattern <- paste(lipid_keywords, collapse="|")
+kegg_lipid_related <- kegg_hier %>%
+  filter(
+    grepl(pattern, Pathway_Name, ignore.case = TRUE) |
+      grepl(pattern, Level2,      ignore.case = TRUE)
+  )
+kegg_lipid_annot <- kegg_lipid_related %>%
+  left_join(kegg_links, by = "Pathway_ID")
+
+# Map ENTREZ → SYMBOL
+entrez_to_symbol <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = unique(kegg_lipid_annot$ENTREZID),
+  keytype = "ENTREZID",
+  columns = c("ENTREZID","SYMBOL")
+)
+kegg_lipid_annot <- kegg_lipid_annot %>%
+  left_join(entrez_to_symbol, by = "ENTREZID")
+
+# Save the filtered lists
+write.xlsx(kegg_lipid_related, file.path(out_dir, "kegg_lipid_related.xlsx"))
+write.xlsx(kegg_lipid_annot,   file.path(out_dir, "kegg_lipid_annot.xlsx"))
+
+
+# 2.2 Intersect KEGG sets with MOFA features (Proteome view)
+# Features present in the selected MOFA view (optionally per-group)
+mofa_features <- tryCatch(
+  feature_names(MOFAmodel, view = use_view, group = use_group),
+  error = function(e) feature_names(MOFAmodel, view = use_view) # fallback if no groups
+)
+mofa_symbols <- unique(mofa_features)  # assuming features are SYMBOLs in this view
+# Summarize overlap ratio for each lipid-related pathway
+pathway_overlap_summary <- kegg_lipid_annot %>%
+  group_by(Pathway_ID, Pathway_Name, Level1, Level2) %>%
+  summarise(
+    Total_Genes   = n_distinct(SYMBOL[!is.na(SYMBOL)]),
+    Matched_Genes = n_distinct(SYMBOL[!is.na(SYMBOL) & SYMBOL %in% mofa_symbols]),
+    Overlap_Ratio = ifelse(Total_Genes > 0, Matched_Genes / Total_Genes, 0),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Overlap_Ratio))
+
+# Filter by overlap threshold (edit as needed)
+pathway_filtered <- pathway_overlap_summary %>% filter(Overlap_Ratio >= 0.20)
+cat("Number of lipid-related pathways with overlap ≥ 0.2:", nrow(pathway_filtered), "\n")
+
+write.xlsx(pathway_overlap_summary, file.path(out_dir, "pathway_overlap_summary.xlsx"))
+write.xlsx(pathway_filtered,       file.path(out_dir, "kegg_pathway_filtered.xlsx"))
+
+# Keep only unique SYMBOLs for selected lipid pathways
+kegg_lipid_selected <- kegg_lipid_annot %>%
+  semi_join(pathway_filtered, by = "Pathway_ID") %>%
+  distinct(SYMBOL, .keep_all = TRUE)
+
+write.xlsx(kegg_lipid_selected, file.path(out_dir, "kegg_lipid_selected.xlsx"))
+
+# 2.3 Build feature sets (pathway → SYMBOLs) and binary membership matrix
+selected_pathways <- pathway_filtered$Pathway_ID
+kegg_gene_sets <- kegg_lipid_annot %>%
+  filter(Pathway_ID %in% selected_pathways) %>%
+  filter(!is.na(SYMBOL), SYMBOL %in% mofa_symbols) %>%
+  group_by(Pathway_Name) %>%
+  summarise(Genes = list(unique(SYMBOL)), .groups = "drop")
+gene_sets_list <- setNames(kegg_gene_sets$Genes, kegg_gene_sets$Pathway_Name)
+# Validate structure
+is_valid <- is.list(gene_sets_list) &&
+  all(sapply(gene_sets_list, is.character)) &&
+  !is.null(names(gene_sets_list)) &&
+  all(names(gene_sets_list) != "")
+stopifnot(is_valid)
+
+# Binary matrix: rows = pathways, cols = genes (0/1)
+all_genes <- unique(unlist(gene_sets_list))
+all_paths <- names(gene_sets_list)
+
+binary_matrix <- matrix(0, nrow = length(all_paths), ncol = length(all_genes),
+                        dimnames = list(all_paths, all_genes))
+for (p in all_paths) {
+  binary_matrix[p, gene_sets_list[[p]]] <- 1
+}
+binary_df <- as.data.frame(binary_matrix) %>%
+  rownames_to_column("Pathway_Name")
+
+write.xlsx(binary_df, file.path(out_dir, "kegg_binary_df.xlsx"))
+
+# 2.4 Run enrichment with MOFA2 (rank-based test, positive/negative weights)
+# Positive enrichment (features with higher positive weights in the factor)
+res_pos <- run_enrichment(
+  object       = MOFAmodel,
+  view         = use_view,
+  factors      = use_factor,
+  feature.sets = binary_matrix,   # rows=sets, cols=features (SYMBOL)
+  set.statistic= "rank.sum",
+  sign         = "positive",
+  min.size     = 5,
+  alpha        = 0.05)
+# Negative enrichment (features with more negative weights)
+res_neg <- run_enrichment(
+  object       = MOFAmodel,
+  view         = use_view,
+  factors      = use_factor,
+  feature.sets = binary_matrix,
+  set.statistic= "rank.sum",
+  sign         = "negative",
+  min.size     = 5,
+  alpha        = 0.05
+)
+
+# 2.5 Extract factor weights and map significant pathways to member genes
+# Get feature weights for the chosen factor/view
+weights_df <- get_weights(
+  MOFAmodel, view = use_view, factors = use_factor, as.data.frame = TRUE
+) %>%
+  # columns typically: feature, view, factor, value
+  transmute(Feature = feature, Weight = value) %>%
+  distinct()
+# Split by sign
+pos_genes <- weights_df %>% filter(!is.na(Weight), Weight > 0) %>% pull(Feature) %>% unique()
+neg_genes <- weights_df %>% filter(!is.na(Weight), Weight < 0) %>% pull(Feature) %>% unique()
+# Helper: collect member genes for significant pathways (by sign)
+collect_sig_genes <- local(function(res_enrichment, sign_label, gene_universe) {
+  # Get significant pathway names for the factor
+  sig_paths <- res_enrichment[["sigPathways"]][[1]]
+  if (is.null(sig_paths) || length(sig_paths) == 0) return(tibble())
+  paths_use <- intersect(sig_paths, rownames(binary_matrix))
+  if (length(paths_use) == 0) return(tibble())
+  bm_sub <- as.matrix(binary_matrix[paths_use, , drop = FALSE])
+  mode(bm_sub) <- "numeric"
+  sig_list <- lapply(paths_use, function(p) {
+    members <- colnames(bm_sub)[bm_sub[p,] == 1]
+    hit     <- intersect(members, gene_universe)
+    if (length(hit) == 0) return(NULL)
+    tibble(Pathway = p, Gene = hit)
+  })
+  out <- bind_rows(sig_list)
+  if (nrow(out) == 0) return(tibble())
+  out %>%
+    left_join(weights_df, by = c("Gene" = "Feature")) %>%
+    mutate(Sign = sign_label) %>%
+    arrange(Pathway, Weight)
+})
+sig_pos_table <- collect_sig_genes(res_pos, "positive", pos_genes)
+sig_neg_table <- collect_sig_genes(res_neg, "negative", neg_genes)
+combined_sig <- bind_rows(sig_pos_table, sig_neg_table)
+if (nrow(combined_sig) > 0) {
+  write.xlsx(combined_sig, file.path(out_dir, paste0("KEGG_enriched_genes_", use_factor, ".xlsx")))
+} else {
+  message("No enriched genes found for the chosen factor/sign settings.")
+}
+# 2.6 Save enrichment tables (p-values, FDR, statistics, sig pathways)
+save_enrichment_tables <- local(function(res_enrichment, label) {
+  # p-values
+  pval_df <- as.data.frame(res_enrichment$pval) %>%
+    rownames_to_column("Pathway")
+  # FDR-adjusted p-values
+  pval_adj_df <- as.data.frame(res_enrichment$pval.adj) %>%
+    rownames_to_column("Pathway")
+  # feature statistics
+  feature_stat_df <- as.data.frame(res_enrichment$feature.statistics) %>%
+    rownames_to_column("Feature")
+  # set statistics
+  set_stat_df <- as.data.frame(res_enrichment$set.statistics) %>%
+    rownames_to_column("Pathway")
+  # significant pathways incidence matrix (pathway × factor)
+  sig_list <- res_enrichment$sigPathways
+  all_paths <- unique(unlist(sig_list))
+  if (length(all_paths) == 0) {
+    sig_pathway_df <- tibble()
+  } else {
+    sig_mat <- matrix(0, nrow = length(all_paths), ncol = length(sig_list),
+                      dimnames = list(all_paths, paste0("Factor", seq_along(sig_list))))
+    for (i in seq_along(sig_list)) {
+      if (!is.null(sig_list[[i]])) sig_mat[sig_list[[i]], i] <- 1
+    }
+    sig_pathway_df <- as.data.frame(sig_mat) %>%
+      rownames_to_column("Pathway")
+  }
+  write.xlsx(
+    list(
+      P_value              = pval_df,
+      FDR_Adjusted_P       = pval_adj_df,
+      Feature_Statistics   = feature_stat_df,
+      Set_Statistics       = set_stat_df,
+      Significant_Pathways = sig_pathway_df
+    ),
+    file = file.path(out_dir, paste0(use_factor, "_KEGG_", label, ".xlsx"))
+  )
+})
+save_enrichment_tables(res_pos, "positive")
+save_enrichment_tables(res_neg, "negative")
+
+# 2.7 Plot enrichment bubbles
+# Positive
+p_pos <- plot_enrichment(
+  res_pos, alpha = 0.05, factor = 1,
+  text_size = 0.9, dot_size = 3, max.pathways = 10)
+print(p_pos)
+ggsave(filename = file.path(out_dir, paste0(use_factor, "_KEGG_positive.pdf")),
+       plot = p_pos, width = 9, height = 4)
+# Negative
+p_neg <- plot_enrichment(
+  res_neg, alpha = 0.05, factor = 1,
+  text_size = 0.9, dot_size = 3, max.pathways = 10)
+print(p_neg)
+ggsave(filename = file.path(out_dir, paste0(use_factor, "_KEGG_negative.pdf")),
+       plot = p_neg, width = 9, height = 4)
+message("✓ KEGG enrichment (lipid-related) finished. Results written to: ", normalizePath(out_dir))
+
