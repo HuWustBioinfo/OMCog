@@ -1,1 +1,58 @@
+# 1. Multi-Omics Factor Analysis (MOFA)---------------------------------
+# 1.1 Create MOFA object
+# Prepare a list of omics matrices (remove ID columns beforehand)
+mofa_data <- list(
+  Lipidome  = lipid_matrix,     # lipidomics data
+  Proteome  = protein_matrix    # proteomics data
+)
+# Initialize MOFA object
+MOFAobject <- create_mofa(mofa_data)
+# Check the object class
+class(MOFAobject)
+# Visualize data overview (missing values, features per view, etc.)
+plot_data_overview(MOFAobject)
 
+
+# 1.2 Define MOFA options
+## 1) Data options
+data_opts <- get_default_data_options(MOFAobject)
+data_opts$scale_views <- TRUE      # Important: scale each omics view before training
+## 2) Model options
+model_opts <- get_default_model_options(MOFAobject)
+model_opts   # inspect default settings
+## 3) Training options
+train_opts <- get_default_training_options(MOFAobject)
+train_opts$convergence_mode <- "slow"   # more stable convergence (recommended)
+train_opts$seed <- 42                   # reproducibility
+train_opts
+
+
+# 1.3 Train the MOFA model
+# Ensure the correct Python environment (MOFA2 backend)
+library(reticulate)
+use_condaenv("mofa_env", required = TRUE)     # name of your MOFA conda env
+conda_list()                                 # optional: check environment list
+# Explicit path to Python if needed
+use_condaenv("/Users/luoyu/miniforge3/envs/mofa_env/bin/python", required = TRUE)
+py_config()                                  # confirm configuration
+# Prepare MOFA object for training
+MOFAobject <- prepare_mofa(
+  MOFAobject,
+  data_options     = data_opts,
+  model_options    = model_opts,
+  training_options = train_opts
+)
+# Run MOFA (disable basilisk if using external conda env)
+MOFAmodel <- run_mofa(MOFAobject, use_basilisk = FALSE)
+
+
+# 1.4 Save and reload trained model
+# Save the trained MOFA model with a timestamped filename
+saveRDS(
+  MOFAobject,
+  sprintf("/Users/luoyu/Desktop/Cohort/Results/3-MOFA/MOFA_trained_%s.rds",
+          format(Sys.time(), "%Y%m%d_%H%M%S")))
+# Example: Load a previously trained MOFA model
+MOFAmodel <- readRDS("/Users/luoyu/Desktop/Cohort/Results/3-MOFA/MOFA_trained_20250806_104143.rds")
+# Assign the loaded model as the active MOFA object for downstream analyses
+MOFAobject <- MOFAmodel
