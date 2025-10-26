@@ -1,5 +1,4 @@
-#1.Differential analysis with limma (with covariates)---------------------------------------------
-# Goal: compare GroupB vs GroupA for all proteins/genes, adjusting for covariates
+#1.Differential analysis with limma (with covariates)--------------------------------------------------
 # Packages
 suppressPackageStartupMessages({
   library(readr)       # or readxl if you use Excel
@@ -10,25 +9,28 @@ suppressPackageStartupMessages({
   library(openxlsx)    # optional: write Excel
 })
 set.seed(007) 
-# 1) Load data (REPLACE)
+# 2) Load data (REPLACE)
 # Expression matrix: rows = features (proteins/genes), cols = samples
 # Metadata: one row per sample; must include: sample_id, group, covariates
 expr <- read_csv("expression_matrix.csv")          # first column = feature id
 meta <- read_csv("metadata.csv")                   # columns: sample_id, group, sex, residence, agegrp, edugrp
-# 2) Tidy expression: set rownames to feature id
+
+# 3) Tidy expression: set rownames to feature id
 stopifnot(ncol(expr) >= 2)
 expr <- as.data.frame(expr)
 feature_col <- 1
 rownames(expr) <- expr[[feature_col]]
 expr <- expr[, -(feature_col), drop = FALSE]
-# 3) Align samples between expr and meta
+
+# 4) Align samples between expr and meta
 stopifnot("sample_id" %in% colnames(meta))
 common_ids <- intersect(colnames(expr), meta$sample_id)
 expr <- expr[, common_ids, drop = FALSE]
 meta <- meta %>% filter(sample_id %in% common_ids)
 # Safety check
 stopifnot(identical(colnames(expr), meta$sample_id))
-# 4) Model design (EDIT HERE)
+
+# 5) Model design (EDIT HERE)
 #    - group: two levels, e.g., "CI", "NCI"
 #    - covariates: e.g., sex, residence, agegrp, edugrp
 meta <- meta %>%
@@ -41,15 +43,18 @@ meta <- meta %>%
 # Design with no intercept: each group gets a column
 design <- model.matrix(~ 0 + group + sex + residence + agegrp + edugrp, data = meta)
 colnames(design) <- make.names(colnames(design))
-# 5) Fit linear model with limma
+
+# 6) Fit linear model with limma
 fit <- lmFit(expr, design)
-# 6) Contrast: GroupB vs GroupA (EDIT the level names to match your meta$group)
+
+# 7) Contrast: GroupB vs GroupA (EDIT the level names to match your meta$group)
 #    If design has columns groupA and groupB:
 stopifnot(all(c("groupA","groupB") %in% colnames(design)))
 cont <- makeContrasts(BvsA = groupB - groupA, levels = design)
 fit2 <- contrasts.fit(fit, cont)
 fit2 <- eBayes(fit2)
-# 7) Results (BH-adjusted p-values)
+
+# 8) Results (BH-adjusted p-values)
 res <- topTable(fit2, coef = "BvsA", number = Inf, adjust.method = "BH") %>%
   rownames_to_column(var = "Feature") %>%
   rename(
@@ -62,3 +67,91 @@ res <- topTable(fit2, coef = "BvsA", number = Inf, adjust.method = "BH") %>%
   )
 
 
+# 2.Trend clustering with Mfuzz (generic template)----------------------------------------------------------------------
+# Goal: cluster mean expression profiles across ordered groups (e.g., BMI quartiles)
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(tibble)
+  library(readr)        # or readxl
+  library(limma)        # optional
+  library(Mfuzz)
+  library(Biobase)
+  library(vegan)        # for cascadeKM (optional, choose K)
+})
+# 1) Load your data
+# expr: rows = features (proteins/genes), cols = samples; first column = feature id
+# meta: one row per sample; columns include: sample_id, BMI_quartile (or any ordered group), and other covariates
+# Example (replace with your own I/O):
+# expr <- read_csv("expression_matrix.csv")            # first column: feature_id
+# meta <- read_csv("metadata.csv")                     # sample_id, BMI_quartile
+
+# 2) Prepare expression
+stopifnot(ncol(expr) >= 2)
+expr <- as.data.frame(expr)
+rownames(expr) <- expr[[1]]
+expr <- expr[, -1, drop = FALSE]         # numeric matrix: features x samples
+
+# 3) Align samples with meta
+stopifnot("sample_id" %in% colnames(meta))
+common_ids <- intersect(colnames(expr), meta$sample_id)
+expr <- expr[, common_ids, drop = FALSE]
+meta <- meta %>% filter(sample_id %in% common_ids)
+stopifnot(identical(colnames(expr), meta$sample_id))
+
+# 4) Compute group means
+# Use an ordered/ordinal grouping variable, e.g., BMI quartiles
+stopifnot("BMI_quartile" %in% colnames(meta))
+meta <- meta %>% mutate(BMI_quartile = factor(BMI_quartile, ordered = TRUE))
+# Make a long table then compute mean per group
+long_df <- expr %>%
+  as.data.frame() %>%
+  rownames_to_column("Feature") %>%
+  pivot_longer(-Feature, names_to = "sample_id", values_to = "value") %>%
+  left_join(meta %>% select(sample_id, BMI_quartile), by = "sample_id")
+group_mean <- long_df %>%
+  group_by(Feature, BMI_quartile) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop")
+# Back to wide: rows = features, cols = groups (ordered)
+data_matrix <- group_mean %>%
+  pivot_wider(names_from = BMI_quartile, values_from = mean_value) %>%
+  arrange(Feature) %>%
+  column_to_rownames("Feature") %>%
+  as.matrix()
+# (Optional) ensure columns are in the natural order of the factor
+data_matrix <- data_matrix[, levels(meta$BMI_quartile), drop = FALSE]
+
+# 5) (Optional) choose K using cascadeKM
+set.seed(7)
+# cascadeKM expects rows as observations; here each row is a feature profile across groups -> OK
+ckm <- cascadeKM(data_matrix, inf.gr = 2, sup.gr = 12, iter = 500)
+# Pick K with max CH index
+ch <- ckm$results[,"ch"] %||% ckm$results[,"Calinski"] %||% ckm$results[, ncol(ckm$results)]
+# Fallback if column name differs; adjust to your ckm$results column names if needed.
+K <- as.integer(ckm$nf[ which.max(ch) ])
+message(sprintf("Auto-selected K by CH index: %d", K))
+
+# 6) Build ExpressionSet & standardise
+eset <- new("ExpressionSet", exprs = data_matrix)     # rows = features, cols = ordered groups
+eset <- standardise(eset)                              # z-score per feature
+m <- mestimate(eset)                                   # fuzzifier
+
+# 7) Fuzzy c-means clustering
+cl <- mfuzz(eset, c = K, m = m)
+
+# 8) Plot clusters
+# One PDF with multi-panel cluster profiles
+pdf("mfuzz_clusters.pdf", width = 10, height = 8)
+mfuzz.plot(eset, cl = cl, mfrow = c(ceiling(K/4), 4), time.labels = colnames(exprs(eset)),
+           new.window = FALSE)
+dev.off()
+
+# 9) Export cluster membership
+membership <- as.data.frame(cl$membership)              # membership score per cluster
+colnames(membership) <- paste0("Cluster_", seq_len(K))
+membership <- membership %>%
+  rownames_to_column("Feature") %>%
+  mutate(Assigned = apply(.[, -1, drop = FALSE], 1, which.max))  # hard assignment
+readr::write_csv(membership, "mfuzz_membership.csv")
+
+# (Optional) list of features per cluster
+clusters_list <- split(membership$Feature, membership$Assigned)
+# saveRDS(clusters_list, file = "mfuzz_clusters_list.rds")
