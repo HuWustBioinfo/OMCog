@@ -1,1 +1,64 @@
+#1.Differential analysis with limma (with covariates)---------------------------------------------
+# Goal: compare GroupB vs GroupA for all proteins/genes, adjusting for covariates
+# Packages
+suppressPackageStartupMessages({
+  library(readr)       # or readxl if you use Excel
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(limma)
+  library(openxlsx)    # optional: write Excel
+})
+set.seed(007) 
+# 1) Load data (REPLACE)
+# Expression matrix: rows = features (proteins/genes), cols = samples
+# Metadata: one row per sample; must include: sample_id, group, covariates
+expr <- read_csv("expression_matrix.csv")          # first column = feature id
+meta <- read_csv("metadata.csv")                   # columns: sample_id, group, sex, residence, agegrp, edugrp
+# 2) Tidy expression: set rownames to feature id
+stopifnot(ncol(expr) >= 2)
+expr <- as.data.frame(expr)
+feature_col <- 1
+rownames(expr) <- expr[[feature_col]]
+expr <- expr[, -(feature_col), drop = FALSE]
+# 3) Align samples between expr and meta
+stopifnot("sample_id" %in% colnames(meta))
+common_ids <- intersect(colnames(expr), meta$sample_id)
+expr <- expr[, common_ids, drop = FALSE]
+meta <- meta %>% filter(sample_id %in% common_ids)
+# Safety check
+stopifnot(identical(colnames(expr), meta$sample_id))
+# 4) Model design (EDIT HERE)
+#    - group: two levels, e.g., "CI", "NCI"
+#    - covariates: e.g., sex, residence, agegrp, edugrp
+meta <- meta %>%
+  mutate(
+    group    = factor(group),            # ensure factor
+    sex      = factor(sex),
+    residence= factor(residence),
+    agegrp   = factor(agegrp),
+    edu      = factor(edugrp))
+# Design with no intercept: each group gets a column
+design <- model.matrix(~ 0 + group + sex + residence + agegrp + edugrp, data = meta)
+colnames(design) <- make.names(colnames(design))
+# 5) Fit linear model with limma
+fit <- lmFit(expr, design)
+# 6) Contrast: GroupB vs GroupA (EDIT the level names to match your meta$group)
+#    If design has columns groupA and groupB:
+stopifnot(all(c("groupA","groupB") %in% colnames(design)))
+cont <- makeContrasts(BvsA = groupB - groupA, levels = design)
+fit2 <- contrasts.fit(fit, cont)
+fit2 <- eBayes(fit2)
+# 7) Results (BH-adjusted p-values)
+res <- topTable(fit2, coef = "BvsA", number = Inf, adjust.method = "BH") %>%
+  rownames_to_column(var = "Feature") %>%
+  rename(
+    logFC   = logFC,     # effect size
+    AveExpr = AveExpr,
+    t       = t,
+    P.Value = P.Value,
+    adj.P.Val = adj.P.Val,
+    B = B
+  )
+
 
