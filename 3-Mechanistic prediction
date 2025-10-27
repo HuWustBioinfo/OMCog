@@ -48,10 +48,10 @@ MOFAmodel <- run_mofa(MOFAobject, use_basilisk = FALSE)
 # Save the trained MOFA model with a timestamped filename
 saveRDS(
   MOFAobject,
-  sprintf("/Users/luoyu/Desktop/Cohort/Results/3-MOFA/MOFA_trained_%s.rds",
+  sprintf("/Users/Desktop/Cohort/Results/3-MOFA/MOFA_trained_%s.rds",
           format(Sys.time(), "%Y%m%d_%H%M%S")))
 # Example: Load a previously trained MOFA model
-MOFAmodel <- readRDS("/Users/luoyu/Desktop/Cohort/Results/3-MOFA/MOFA_trained_20250806_104143.rds")
+MOFAmodel <- readRDS("/Users/Desktop/Cohort/Results/3-MOFA/MOFA_trained_20250806_104143.rds")
 # Assign the loaded model as the active MOFA object for downstream analyses
 MOFAobject <- MOFAmodel
 
